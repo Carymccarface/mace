@@ -1,5 +1,6 @@
 # pylint: disable=too-many-lines  # magnetic MACE variants live here
 import logging
+import math
 from abc import abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
@@ -832,6 +833,10 @@ class PolarMACE(ScaleShiftMACE):
             pbc_handling=pbc_handling,
         )
         self.set_spin_interaction_enabled(spin_interaction_enabled)
+        if self.spin_interaction_enabled != (spin_yukawa_kappa is not None):
+            raise ValueError(
+                "spin_interaction_enabled and spin_yukawa_kappa must be enabled together"
+            )
         self.set_spin_yukawa(spin_yukawa_kappa)
 
         field_layout_target = (
@@ -869,6 +874,7 @@ class PolarMACE(ScaleShiftMACE):
             fixedpoint_update_config = {}
         fixedpoint_update_config = fixedpoint_update_config.copy()
         self._fixedpoint_update_config = fixedpoint_update_config.copy()
+        fixedpoint_update_config.pop("spin_field_channels", None)
         lr_source_cls = fixedpoint_update_config.pop(
             "type", "AgnosticEmbeddedOneBodyVariableUpdate"
         )
@@ -915,6 +921,7 @@ class PolarMACE(ScaleShiftMACE):
                     field_norm_factor=float(field_norm_factor or 1.0),
                     cueq_config=cueq_config,
                     oeq_config=oeq_config,
+                    spin_field_channels=self.spin_interaction_enabled,
                     **fixedpoint_update_config,
                 )
             )
@@ -961,34 +968,82 @@ class PolarMACE(ScaleShiftMACE):
             cueq_config=cueq_config,
         )
 
-        self.configure_charge_only_tied_fields()
+        self.configure_tied_spin_field_weights()
 
-    def configure_charge_only_tied_fields(self) -> None:
-        """Idempotently convert pretrained field maps; this branch is charge-only."""
+    def configure_tied_spin_field_weights(self) -> None:
+        """Idempotently tie alpha/beta field maps, retaining channels when enabled."""
         from .field_blocks import AgnosticChargeBiasedLinearPotentialEmbedding, TiedSpinFieldLinear
-        self.spin_interaction_enabled = False
-        self.spin_yukawa_kappa = None
         for module in list(self.modules()):
             if isinstance(module, AgnosticChargeBiasedLinearPotentialEmbedding):
-                if not isinstance(module.potential_linear, TiedSpinFieldLinear):
-                    module.potential_linear = TiedSpinFieldLinear(module.potential_linear)
+                if isinstance(module.potential_linear, TiedSpinFieldLinear):
+                    module.potential_linear.preserve_spin_channels = (
+                        self.spin_interaction_enabled
+                    )
+                else:
+                    module.potential_linear = TiedSpinFieldLinear(
+                        module.potential_linear,
+                        preserve_spin_channels=self.spin_interaction_enabled,
+                    )
 
     def __setstate__(self, state):
-        """Restore and convert whole-model weights to charge-only tied fields."""
+        """Restore and convert whole-model weights to tied field maps."""
         super().__setstate__(state)
         ensure_polar_compatibility(self)
-        self.configure_charge_only_tied_fields()
+        if not hasattr(self, "spin_interaction_enabled"):
+            self.spin_interaction_enabled = False
+        if not hasattr(self, "spin_yukawa_kappa"):
+            self.spin_yukawa_kappa = None
+        self.configure_tied_spin_field_weights()
+        for update_block in self.field_dependent_charges_maps:
+            if not hasattr(update_block, "spin_field_channels"):
+                update_block.spin_field_channels = False
 
     def set_spin_interaction_enabled(self, enabled: bool = False) -> None:
-        """This branch permits only charge-field propagation."""
-        if enabled:
-            raise ValueError("tie-spin-field-weights only supports spin_interaction_enabled=False")
-        self.spin_interaction_enabled = False
+        """Enable a screened spin field in addition to the Coulomb charge field."""
+        enabled = bool(enabled)
+        if (
+            hasattr(self, "field_dependent_charges_maps")
+            and enabled != self.spin_interaction_enabled
+        ):
+            raise RuntimeError(
+                "Changing spin interaction after model construction requires "
+                "rebuilding the PolarMACE update blocks."
+            )
+        self.spin_interaction_enabled = enabled
 
     def set_spin_yukawa(self, kappa: Optional[float] = None) -> None:
-        """Accept only None: no spin field is propagated on this branch."""
+        """Configure the descriptor's screened spin-field projection."""
+        if hasattr(self, "field_dependent_charges_maps") and (
+            (kappa is not None) != self.spin_interaction_enabled
+        ):
+            raise ValueError(
+                "spin_interaction_enabled and spin_yukawa_kappa must be enabled together"
+            )
         if kappa is not None:
-            raise ValueError("This charge-only branch does not propagate a Yukawa spin field")
+            if not math.isfinite(kappa) or kappa <= 0:
+                raise ValueError(
+                    "Yukawa kappa must be finite and positive (inverse Angstrom)."
+                )
+            configure_yukawa = getattr(
+                self.electric_potential_descriptor, "configure_yukawa", None
+            )
+            if configure_yukawa is None:
+                raise ImportError(
+                    "Spin Yukawa requires a graph_longrange build with "
+                    "GTOElectrostaticFeatures.configure_yukawa."
+                )
+            if not callable(
+                getattr(
+                    self.electric_potential_descriptor,
+                    "forward_dynamic_yukawa",
+                    None,
+                )
+            ):
+                raise ImportError(
+                    "Spin Yukawa requires a graph_longrange build with "
+                    "GTOElectrostaticFeatures.forward_dynamic_yukawa."
+                )
+            configure_yukawa(kappa)
         self.spin_yukawa_kappa = kappa
 
     def set_electrostatic_pbcs(self, pbc_handling: str) -> None:
@@ -1223,13 +1278,37 @@ class PolarMACE(ScaleShiftMACE):
             if charges_to_mul_ir is not None:
                 source_feats_alpha = charges_to_mul_ir(source_feats_alpha)
                 source_feats_beta = charges_to_mul_ir(source_feats_beta)
-            # Charge-only propagation: a single Coulomb solve, split equally.
-            field_charge = self.electric_potential_descriptor.forward_dynamic(
-                cache=field_feature_cache,
-                source_feats=source_feats_alpha + source_feats_beta,
-            )
-            field_feats_alpha = 0.5 * field_charge
-            field_feats_beta = 0.5 * field_charge
+            if self.spin_interaction_enabled:
+                field_charge = self.electric_potential_descriptor.forward_dynamic(
+                    cache=field_feature_cache,
+                    source_feats=source_feats_alpha + source_feats_beta,
+                )
+                if field_feature_cache["mode"] == "realspace":
+                    k_factor_yukawa = None
+                else:
+                    kappa = self.spin_yukawa_kappa
+                    if kappa is None:
+                        raise RuntimeError(
+                            "Spin Yukawa is enabled without a configured kappa."
+                        )
+                    k_factor_yukawa = 1.0 / (
+                        field_feature_cache["k_norm2"]
+                        + kappa**2
+                    )
+                field_spin = self.electric_potential_descriptor.forward_dynamic_yukawa(
+                    cache=field_feature_cache,
+                    source_feats=source_feats_alpha - source_feats_beta,
+                    k_factor_yukawa=k_factor_yukawa,
+                )
+                field_feats_alpha = 0.5 * (field_charge + field_spin)
+                field_feats_beta = 0.5 * (field_charge - field_spin)
+            else:
+                field_charge = self.electric_potential_descriptor.forward_dynamic(
+                    cache=field_feature_cache,
+                    source_feats=source_feats_alpha + source_feats_beta,
+                )
+                field_feats_alpha = 0.5 * field_charge
+                field_feats_beta = 0.5 * field_charge
             field_from_mul_ir = getattr(self, "_field_from_mul_ir", None)
             if field_from_mul_ir is not None:
                 field_feats_alpha = field_from_mul_ir(field_feats_alpha)

@@ -115,13 +115,9 @@ class PotentialEmbeddingBlock(torch.nn.Module):
 
 
 class TiedSpinFieldLinear(torch.nn.Module):
-    """One learned map of alpha+beta, initialized to the mean effective map.
+    """Share one learned field map across alpha and beta inputs."""
 
-    Input is the concatenation of two identical mul_ir layouts. Conversion
-    accounts for e3nn path normalization, not just stored parameter values.
-    """
-
-    def __init__(self, original):
+    def __init__(self, original, preserve_spin_channels: bool = False):
         super().__init__()
         irreps = original.irreps_in
         half = len(irreps) // 2
@@ -146,9 +142,14 @@ class TiedSpinFieldLinear(torch.nn.Module):
                     raise ValueError("Missing matching tied field instruction")
         self.train(original.training)
         self.linear.weight.requires_grad_(original.weight.requires_grad)
+        self.preserve_spin_channels = preserve_spin_channels
 
     def forward(self, fields: torch.Tensor) -> torch.Tensor:
-        return self.linear(fields[..., :self.channel_dim] + fields[..., self.channel_dim:])
+        alpha = fields[..., :self.channel_dim]
+        beta = fields[..., self.channel_dim:]
+        if self.preserve_spin_channels:
+            return torch.cat((self.linear(alpha), self.linear(beta)), dim=-1)
+        return self.linear(alpha + beta)
 
 
 @compile_mode("script")
@@ -233,10 +234,27 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
         node_feats_emb = self.node_feats_linear(node_feats_in)
         charges_emb = self.charge_embedding(charges_in)
         if node_feats_from_mul_ir is not None:
-            potential_emb = node_feats_from_mul_ir(potential_emb)
+            if potential_emb.size(-1) == 2 * node_feats_emb.size(-1):
+                potential_alpha = node_feats_from_mul_ir(
+                    potential_emb[..., : node_feats_emb.size(-1)]
+                )
+                potential_beta = node_feats_from_mul_ir(
+                    potential_emb[..., node_feats_emb.size(-1) :]
+                )
+                potential_emb = torch.cat((potential_alpha, potential_beta), dim=-1)
+            else:
+                potential_emb = node_feats_from_mul_ir(potential_emb)
             node_feats_emb = node_feats_from_mul_ir(node_feats_emb)
             charges_emb = node_feats_from_mul_ir(charges_emb)
 
+        if potential_emb.size(-1) == 2 * node_feats_emb.size(-1):
+            potential_alpha = potential_emb[..., : node_feats_emb.size(-1)]
+            potential_beta = potential_emb[..., node_feats_emb.size(-1) :]
+            common_embedding = node_feats_emb + charges_emb
+            return torch.cat(
+                (potential_alpha + common_embedding, potential_beta + common_embedding),
+                dim=-1,
+            )
         return potential_emb + node_feats_emb + charges_emb
 
 
@@ -517,9 +535,11 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         ] = AgnosticChargeBiasedLinearPotentialEmbedding,
         nonlinearity_cls: Type[torch.nn.Module] = NoNonLinearity,
         num_elements: Optional[int] = None,
+        spin_field_channels: bool = False,
         **kwargs,
     ) -> None:
         _ = (nonlinearity_cls, num_elements)
+        self.spin_field_channels = spin_field_channels
         # product irreps is node_feats_irreps but only l=0
         invar_irreps = o3.Irreps(f"{self.node_feats_irreps.count(o3.Irrep(0, 1))}x0e")
         self.potential_embedding = potential_embedding_cls(
@@ -553,7 +573,13 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             ),
         )
         self.nonlinearity = RadialMLP(
-            [2 * invar_irreps.dim] + [64, 64, 64] + [invar_irreps.dim]
+            [
+                (3 if self.spin_field_channels else 2) * invar_irreps.dim,
+                64,
+                64,
+                64,
+                invar_irreps.dim,
+            ]
         )
         _, instructions = tp_out_irreps_with_instructions(
             self.node_feats_irreps,
@@ -619,7 +645,21 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             node_attrs,
             local_charges,
         )
-        invariant_descriptors = self.dot_products(node_feats, mixed_feats)
+        if self.spin_field_channels:
+            channel_dim = self.node_feats_irreps.dim
+            mixed_alpha = mixed_feats[..., :channel_dim]
+            mixed_beta = mixed_feats[..., channel_dim:]
+            invariant_alpha = self.dot_products(node_feats, mixed_alpha)
+            invariant_beta = self.dot_products(node_feats, mixed_beta)
+            invariant_descriptors = torch.cat(
+                (
+                    invariant_alpha + invariant_beta,
+                    invariant_alpha - invariant_beta,
+                ),
+                dim=-1,
+            )
+        else:
+            invariant_descriptors = self.dot_products(node_feats, mixed_feats)
         source_embedding = self.source_embedding(node_attrs)
         invariant_descriptors_embedded = torch.cat(
             [invariant_descriptors, source_embedding], dim=-1
