@@ -71,6 +71,32 @@ from .radial import ZBLBasis
 from .utils import get_edge_vectors_and_lengths, get_symmetric_displacement
 
 
+def _combine_spin_flip_outputs(
+    positive: Dict[str, Optional[torch.Tensor]],
+    negative: Dict[str, Optional[torch.Tensor]],
+) -> Dict[str, Optional[torch.Tensor]]:
+    # Project paired evaluations onto even, odd, or alpha/beta-exchanging outputs.
+    combined: Dict[str, Optional[torch.Tensor]] = {}
+    odd_keys = {"spin_density", "spins"}
+    exchanged_keys = {"charges_history", "spin_charge_density", "fukui_functions"}
+    for key, positive_value in positive.items():
+        negative_value = negative[key]
+        if positive_value is None and negative_value is None:
+            combined[key] = positive_value
+        elif positive_value is None or negative_value is None:
+            raise RuntimeError(f"Spin-flip evaluations disagree on output '{key}'")
+        elif key in odd_keys:
+            combined[key] = 0.5 * (positive_value - negative_value)
+        elif key in exchanged_keys:
+            channel_dim = -1 if key == "fukui_functions" else 1
+            combined[key] = 0.5 * (
+                positive_value + negative_value.flip(dims=(channel_dim,))
+            )
+        else:
+            combined[key] = 0.5 * (positive_value + negative_value)
+    return combined
+
+
 def _copy_mace_readout(
     mace_readout: torch.nn.Module,
     change_irrep_out: Optional[str] = None,  # o3.Irreps("1x1o")
@@ -1019,6 +1045,44 @@ class PolarMACE(ScaleShiftMACE):
         fermi_level: Optional[torch.Tensor] = None,
         external_field: Optional[torch.Tensor] = None,
     ) -> Dict[str, Optional[torch.Tensor]]:
+        # Average both signed projections to enforce spin-flip output symmetry.
+        spin_projection = data.get("spin_projection", data["total_spin"] - 1)
+        positive_data = dict(data)
+        negative_data = dict(data)
+        positive_data["spin_projection"] = spin_projection
+        negative_data["spin_projection"] = -spin_projection
+        forward_kwargs = {
+            "training": training,
+            "compute_force": compute_force,
+            "compute_virials": compute_virials,
+            "compute_stress": compute_stress,
+            "compute_displacement": compute_displacement,
+            "compute_hessian": compute_hessian,
+            "compute_edge_forces": compute_edge_forces,
+            "compute_atomic_stresses": compute_atomic_stresses,
+            "lammps_mliap": lammps_mliap,
+            "fermi_level": fermi_level,
+            "external_field": external_field,
+        }
+        positive = self._forward_single_spin(data=positive_data, **forward_kwargs)
+        negative = self._forward_single_spin(data=negative_data, **forward_kwargs)
+        return _combine_spin_flip_outputs(positive, negative)
+
+    def _forward_single_spin(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,
+        compute_force: bool = True,
+        compute_virials: bool = False,
+        compute_stress: bool = False,
+        compute_displacement: bool = False,
+        compute_hessian: bool = False,
+        compute_edge_forces: bool = False,
+        compute_atomic_stresses: bool = False,
+        lammps_mliap: bool = False,
+        fermi_level: Optional[torch.Tensor] = None,
+        external_field: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Optional[torch.Tensor]]:
         if not GRAPH_LONGRANGE_AVAILABLE:
             raise ImportError(
                 "Cannot import 'graph_longrange'. Install it with "
@@ -1191,8 +1255,8 @@ class PolarMACE(ScaleShiftMACE):
             fukui_norm == 0, torch.ones_like(fukui_norm), fukui_norm
         )
         fukui_sources = fukui_sources / fukui_norm
-        Q_p_S = (data["total_charge"] + (data["total_spin"] - 1))[data["batch"]]
-        Q_m_S = (data["total_charge"] - (data["total_spin"] - 1))[data["batch"]]
+        Q_p_S = (data["total_charge"] + data["spin_projection"])[data["batch"]]
+        Q_m_S = (data["total_charge"] - data["spin_projection"])[data["batch"]]
         pred_total_charges_0 = scatter_sum(
             src=safe_double(spin_charge_density[:, :, 0]),
             index=data["batch"],

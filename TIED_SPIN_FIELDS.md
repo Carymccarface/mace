@@ -25,3 +25,21 @@ checkpoint first; their parameter names and sizes differ.
 Only the first source-update field sum is tied. Local multipole embeddings and
 other alpha/beta-dependent learned components are not tied. Restoring spin
 propagation would require returning to a different branch/implementation.
+
+## Spin-flip symmetry of model outputs
+
+`PolarMACE.forward` evaluates the model at both signs of the spin projection.
+It averages spin-even outputs (including energy, forces, charge, and dipole),
+takes the half-difference of spin-odd outputs, and exchanges alpha/beta channels
+before averaging channel-resolved outputs. This projects even pretrained
+weights onto exact spin-flip output symmetry without tying every internal
+layer, at the cost of two forward evaluations. Retraining can still improve
+accuracy for the resulting symmetrized predictor.
+
+An optional per-structure `spin_projection` tensor supplies the signed
+alpha-minus-beta constraint used for the paired evaluations. If omitted, the
+legacy `total_spin - 1` value is used as its magnitude for backward-compatible
+input handling. Supply `spin_projection` when its sign is known; multiplicity
+alone does not identify a spin orientation. For configuration-based training,
+provide it as a scalar `spin_projection` configuration property; the generic
+`AtomicData` extra-property path carries it into graph batches.
