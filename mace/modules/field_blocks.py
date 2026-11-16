@@ -239,6 +239,19 @@ class AgnosticChargeBiasedLinearPotentialEmbedding(
 
         return potential_emb + node_feats_emb + charges_emb
 
+    @torch.jit.export
+    def embed_charges(self, local_charges: torch.Tensor) -> torch.Tensor:
+        """The charge term of forward alone (it is linear and has no bias)."""
+        charges_to_mul_ir = getattr(self, "_charges_to_mul_ir", None)
+        node_feats_from_mul_ir = getattr(self, "_node_feats_from_mul_ir", None)
+        charges_in = local_charges
+        if charges_to_mul_ir is not None:
+            charges_in = charges_to_mul_ir(charges_in)
+        charges_emb = self.charge_embedding(charges_in)
+        if node_feats_from_mul_ir is not None:
+            charges_emb = node_feats_from_mul_ir(charges_emb)
+        return charges_emb
+
 
 @compile_mode("script")
 class NoNonLinearity(torch.nn.Module):
@@ -612,14 +625,25 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         potential_features: torch.Tensor,
         local_charges: torch.Tensor,
     ) -> torch.Tensor:
+        # local_charges = [q | m]. Relabelling alpha <-> beta leaves q unchanged
+        # (even) and changes the sign of m (odd). The embedding weights act on
+        # (alpha, beta) = ((q + m) / 2, (q - m) / 2) and are linear, so the q
+        # part and the m part can be embedded separately.
+        charge_density, spin_density = local_charges.chunk(2, dim=-1)
         # create pot feats
         mixed_feats = self.potential_embedding(
             potential_features,
             node_feats,
             node_attrs,
-            local_charges,
+            0.5 * torch.cat((charge_density, charge_density), dim=-1),
         )
+        spin_feats = self.potential_embedding.embed_charges(
+            0.5 * torch.cat((spin_density, -spin_density), dim=-1)
+        )
+        # Even descriptors: the q part, plus the square of the (odd) m part.
         invariant_descriptors = self.dot_products(node_feats, mixed_feats)
+        spin_descriptors = self.dot_products(node_feats, spin_feats)
+        invariant_descriptors = invariant_descriptors + spin_descriptors.square()
         source_embedding = self.source_embedding(node_attrs)
         invariant_descriptors_embedded = torch.cat(
             [invariant_descriptors, source_embedding], dim=-1
@@ -633,7 +657,18 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         multipoles = self.readout(new_feats)
         if readout_from_mul_ir is not None:
             multipoles = readout_from_mul_ir(multipoles)
-        return multipoles
+        # Everything in multipoles is even. Read it as [out_a | out_b | Fukui]:
+        # q update = out_a + out_b (even), m update = (out_a - out_b) times the
+        # atomic spin m[:, 0] (even times odd = odd).
+        out_a, out_b = multipoles[:, :-2].chunk(2, dim=-1)
+        return torch.cat(
+            (
+                out_a + out_b,
+                (out_a - out_b) * spin_density[:, :1],
+                multipoles[:, -2:],
+            ),
+            dim=-1,
+        )
 
 
 class PostScfReadout(torch.nn.Module):
@@ -768,15 +803,23 @@ class OneBodyMLPFieldReadout(PostScfReadout):
         charges_0: torch.Tensor,
         charges_induced: torch.Tensor,
     ):
-        q_in = charges_induced + charges_0
+        # charges = [q | m]; linear_up_q acts on (alpha, beta). q_in is the
+        # q part (m = 0) and m_in adds the m part, as in the update block.
+        charge_density, spin_density = (charges_induced + charges_0).chunk(2, dim=-1)
+        q_in = 0.5 * torch.cat((charge_density, charge_density), dim=-1)
+        m_in = q_in + 0.5 * torch.cat((spin_density, -spin_density), dim=-1)
         q_to_mul_ir = getattr(self, "_q_to_mul_ir", None)
         v_to_mul_ir = getattr(self, "_v_to_mul_ir", None)
         up_from_mul_ir = getattr(self, "_up_from_mul_ir", None)
         if q_to_mul_ir is not None:
             q_in = q_to_mul_ir(q_in)
+            m_in = q_to_mul_ir(m_in)
         q_up = self.linear_up_q(q_in)
+        # Subtracting removes the q part and the bias: m_up is odd.
+        m_up = self.linear_up_q(m_in) - q_up
         if up_from_mul_ir is not None:
             q_up = up_from_mul_ir(q_up)
+            m_up = up_from_mul_ir(m_up)
 
         v_in = field_feats
         if v_to_mul_ir is not None:
@@ -786,7 +829,9 @@ class OneBodyMLPFieldReadout(PostScfReadout):
             v_up = up_from_mul_ir(v_up)
         invar_feats = torch.cat(
             [
-                self.dot_products_q(node_feats, q_up),
+                # The energy is even: q part plus the square of the m part.
+                self.dot_products_q(node_feats, q_up)
+                + self.dot_products_q(node_feats, m_up).square(),
                 self.dot_products_v(node_feats, v_up),
             ],
             dim=-1,

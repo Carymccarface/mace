@@ -1176,6 +1176,11 @@ class PolarMACE(ScaleShiftMACE):
         spin_charge_density = spin_charge_density.view(
             spin_charge_density.shape[0], 2, -1
         )
+        # State: q = alpha + beta is unchanged by relabelling alpha <-> beta,
+        # m = alpha - beta changes sign. The backbone features are spin-blind,
+        # so they can only source q: m starts at zero.
+        charge_density = spin_charge_density[:, 0, :] + spin_charge_density[:, 1, :]
+        spin_density = torch.zeros_like(charge_density)
         fukui_input = node_feats
         fukui_to_mul_ir = getattr(self, "_fukui_to_mul_ir", None)
         if fukui_to_mul_ir is not None:
@@ -1191,42 +1196,46 @@ class PolarMACE(ScaleShiftMACE):
             fukui_norm == 0, torch.ones_like(fukui_norm), fukui_norm
         )
         fukui_sources = fukui_sources / fukui_norm
-        Q_p_S = (data["total_charge"] + (data["total_spin"] - 1))[data["batch"]]
-        Q_m_S = (data["total_charge"] - (data["total_spin"] - 1))[data["batch"]]
+        # Constraints: sum(q) = total charge, sum(m) = multiplicity - 1.
+        # Fukui column 0 spreads the missing charge, column 1 the missing spin.
+        q_target = data["total_charge"][data["batch"]]
+        m_target = (data["total_spin"] - 1)[data["batch"]]
         pred_total_charges_0 = scatter_sum(
-            src=safe_double(spin_charge_density[:, :, 0]),
+            src=safe_double(
+                torch.stack((charge_density[:, 0], spin_density[:, 0]), dim=-1)
+            ),
             index=data["batch"],
             dim=0,
             dim_size=num_graphs,
         )[data["batch"]].to(vectors.dtype)
-        spin_charge_density = spin_charge_density.clone()
-        spin_charge_density[:, 0, 0] = spin_charge_density[:, 0, 0] + fukui_sources[
-            :, 0
-        ] * ((Q_p_S / 2) - pred_total_charges_0[:, 0])
-        spin_charge_density[:, 1, 0] = spin_charge_density[:, 1, 0] + fukui_sources[
-            :, 1
-        ] * ((Q_m_S / 2) - pred_total_charges_0[:, 1])
-        # print("spin_charge_density", spin_charge_density)
+        charge_density = charge_density.clone()
+        spin_density = spin_density.clone()
+        charge_density[:, 0] = charge_density[:, 0] + fukui_sources[:, 0] * (
+            q_target - pred_total_charges_0[:, 0]
+        )
+        spin_density[:, 0] = spin_density[:, 0] + fukui_sources[:, 1] * (
+            m_target - pred_total_charges_0[:, 1]
+        )
 
         potential_features = torch.zeros(
             (data["batch"].size(-1), self.potential_irreps.dim),
             device=data["batch"].device,
             dtype=vectors.dtype,
         )
-        field_independent_spin_charge_density = spin_charge_density.clone()
+        field_independent_charge_density = charge_density.clone()
+        field_independent_spin_density = spin_density.clone()
         esps: Optional[torch.Tensor] = None
 
         final_fukui_sources = fukui_sources
         for i in range(self.num_recursion_steps):
-            source_feats_alpha = spin_charge_density[:, 0, :].clone()
-            source_feats_beta = spin_charge_density[:, 1, :].clone()
+            # The Coulomb source alpha + beta is q.
+            source_feats = charge_density.clone()
             if charges_to_mul_ir is not None:
-                source_feats_alpha = charges_to_mul_ir(source_feats_alpha)
-                source_feats_beta = charges_to_mul_ir(source_feats_beta)
+                source_feats = charges_to_mul_ir(source_feats)
             # Charge-only propagation: a single Coulomb solve, split equally.
             field_charge = self.electric_potential_descriptor.forward_dynamic(
                 cache=field_feature_cache,
-                source_feats=source_feats_alpha + source_feats_beta,
+                source_feats=source_feats,
             )
             field_feats_alpha = 0.5 * field_charge
             field_feats_beta = 0.5 * field_charge
@@ -1265,19 +1274,16 @@ class PolarMACE(ScaleShiftMACE):
                 edge_feats=edge_feats,
                 edge_index=data["edge_index"],
                 potential_features=potential_features,
-                local_charges=spin_charge_density.view(
-                    spin_charge_density.shape[0], -1
-                ),
+                local_charges=torch.cat((charge_density, spin_density), dim=-1),
             )
 
+            # One evaluation returns [q update | m update | Fukui q, Fukui m].
             current_fukui_sources = charge_sources_out[:, -2:]
-            charge_sources = charge_sources_out[:, :-2]
-            # print("charge_sources", charge_sources)
-            # print("current_fukui_sources", current_fukui_sources)
-            spin_charge_density_sources = charge_sources.view(
-                spin_charge_density.shape[0], 2, -1
+            charge_sources = charge_sources_out[:, :-2].view(
+                charge_density.shape[0], 2, -1
             )
-            spin_charge_density = spin_charge_density + spin_charge_density_sources
+            charge_density = charge_density + charge_sources[:, 0, :]
+            spin_density = spin_density + charge_sources[:, 1, :]
 
             fukui_norm2 = scatter_sum(
                 src=safe_double(current_fukui_sources),
@@ -1291,18 +1297,21 @@ class PolarMACE(ScaleShiftMACE):
             current_fukui_sources = current_fukui_sources / fukui_norm2
             final_fukui_sources = current_fukui_sources
             pred_total_charges = scatter_sum(
-                src=safe_double(spin_charge_density[:, :, 0]),
+                src=safe_double(
+                    torch.stack((charge_density[:, 0], spin_density[:, 0]), dim=-1)
+                ),
                 index=data["batch"],
                 dim=0,
                 dim_size=num_graphs,
             )[data["batch"]].to(vectors.dtype)
-            spin_charge_density = spin_charge_density.clone()
-            spin_charge_density[:, 0, 0] = spin_charge_density[
-                :, 0, 0
-            ] + current_fukui_sources[:, 0] * ((Q_p_S / 2) - pred_total_charges[:, 0])
-            spin_charge_density[:, 1, 0] = spin_charge_density[
-                :, 1, 0
-            ] + current_fukui_sources[:, 1] * ((Q_m_S / 2) - pred_total_charges[:, 1])
+            charge_density = charge_density.clone()
+            spin_density = spin_density.clone()
+            charge_density[:, 0] = charge_density[:, 0] + current_fukui_sources[
+                :, 0
+            ] * (q_target - pred_total_charges[:, 0])
+            spin_density[:, 0] = spin_density[:, 0] + current_fukui_sources[
+                :, 1
+            ] * (m_target - pred_total_charges[:, 1])
 
         total_energy = e0 + inter_e
         local_q_e = self.local_electron_energy(
@@ -1312,10 +1321,11 @@ class PolarMACE(ScaleShiftMACE):
             edge_feats=edge_feats,
             edge_index=data["edge_index"],
             field_feats=potential_features,
-            charges_0=field_independent_spin_charge_density.view(
-                field_independent_spin_charge_density.shape[0], -1
+            charges_0=torch.cat(
+                (field_independent_charge_density, field_independent_spin_density),
+                dim=-1,
             ),
-            charges_induced=spin_charge_density.view(spin_charge_density.shape[0], -1),
+            charges_induced=torch.cat((charge_density, spin_density), dim=-1),
         )
         le_total = scatter_sum(
             src=local_q_e, index=data["batch"], dim=-1, dim_size=num_graphs
@@ -1325,8 +1335,14 @@ class PolarMACE(ScaleShiftMACE):
         else:
             le_total = torch.zeros_like(le_total)
 
-        charge_density = spin_charge_density.sum(dim=1)
-        spin_density = spin_charge_density[:, 0, :] - spin_charge_density[:, 1, :]
+        # (alpha, beta) = ((q + m) / 2, (q - m) / 2), only for the output keys.
+        spin_charge_density = torch.stack(
+            (
+                0.5 * (charge_density + spin_density),
+                0.5 * (charge_density - spin_density),
+            ),
+            dim=1,
+        )
         charge_density_mul_ir = (
             charges_to_mul_ir(charge_density)
             if charges_to_mul_ir is not None
