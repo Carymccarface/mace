@@ -641,8 +641,9 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
             0.5 * torch.cat((spin_density, -spin_density), dim=-1)
         )
         # Even descriptors: the q part, plus the square of the (odd) m part.
+        # tanh keeps the m part bounded; tanh is odd, so its square is even.
         invariant_descriptors = self.dot_products(node_feats, mixed_feats)
-        spin_descriptors = self.dot_products(node_feats, spin_feats)
+        spin_descriptors = self.dot_products(node_feats, spin_feats).tanh()
         invariant_descriptors = invariant_descriptors + spin_descriptors.square()
         source_embedding = self.source_embedding(node_attrs)
         invariant_descriptors_embedded = torch.cat(
@@ -658,13 +659,13 @@ class AgnosticEmbeddedOneBodyVariableUpdate(FieldUpdateBlock):
         if readout_from_mul_ir is not None:
             multipoles = readout_from_mul_ir(multipoles)
         # Everything in multipoles is even. Read it as [out_a | out_b | Fukui]:
-        # q update = out_a + out_b (even), m update = (out_a - out_b) times the
-        # atomic spin m[:, 0] (even times odd = odd).
+        # q update = out_a + out_b (even), m update = (out_a - out_b) times
+        # tanh of the atomic spin m[:, 0] (even times odd = odd, and bounded).
         out_a, out_b = multipoles[:, :-2].chunk(2, dim=-1)
         return torch.cat(
             (
                 out_a + out_b,
-                (out_a - out_b) * spin_density[:, :1],
+                (out_a - out_b) * spin_density[:, :1].tanh(),
                 multipoles[:, -2:],
             ),
             dim=-1,
@@ -829,9 +830,10 @@ class OneBodyMLPFieldReadout(PostScfReadout):
             v_up = up_from_mul_ir(v_up)
         invar_feats = torch.cat(
             [
-                # The energy is even: q part plus the square of the m part.
+                # The energy is even: q part plus the square of the m part
+                # (bounded by tanh, as in the update block).
                 self.dot_products_q(node_feats, q_up)
-                + self.dot_products_q(node_feats, m_up).square(),
+                + self.dot_products_q(node_feats, m_up).tanh().square(),
                 self.dot_products_v(node_feats, v_up),
             ],
             dim=-1,
